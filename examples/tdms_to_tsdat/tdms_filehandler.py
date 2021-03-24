@@ -14,7 +14,7 @@ class TdmsFileHandler(AbstractFileHandler):
     def read(filename: str, **kwargs) -> xr.Dataset:
         tdms_file = TdmsFile.read(filename)
         for group in tdms_file.groups():
-            df = group.as_dataframe()
+            df = group.as_dataframe() # requires rewriting if tdms file has multiple groups
             for channel in group.channels():
                 df.rename({channel.name : channel.name.strip()}, axis = 1, inplace=True) #remove \n and spaces from channel names and assign inplace to columns axis
         return df.to_xarray() 
