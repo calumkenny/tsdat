@@ -5,37 +5,71 @@ In particular, it will provide declarative methods for being able
 standardize, apply Q/C checks, correct, and transform datastreams
 as a whole, reducing the amount of coding required for data
 processing.
+test
+# Getting Started
 
-# Installation
-This library depends on the ARM ACT library which will be used
-for plotting and data standardization.  You can install it via
-pip, but it has problems on Windows because some of the 
-dependencies require C code to be built.  It's way easier to 
-install the environment via Anaconda, which is described below.
-If you do not want to use Anaconda, you can install the tsdat
-requirements via:
+## Installation
+You can install tsdat and its dependencies using pip
 
 ```bash
-pip3 install -r requirements.txt
+pip install tsdat
 ```
 
-## 1) Install Anaconda
-We recommend using Anaconda to install the required Python environment.
-because some of our plotting dependencies
-require libraries that are difficult to set up on windows machines.
+## Documentation
+For help using tsdat, please see our documentation at
+https://tsdat.readthedocs.io/
 
-https://www.anaconda.com/download/#
+# Docker
+Please see https://hub.docker.com/orgs/tsdat for the list of available 
+tsdat docker images.
 
-## 2) Create Anaconda Environment
+# Installation from Source
+If you will be developing/contributing to the tsdat code base,
+first clone the repository from 
 
 ```bash
-conda create -n tsdat_env -c conda-forge python=3.8 act-atmos cfunits yamllint
+git clone https://github.com/tsdat/tsdat.git
 ```
 
-Note that Windows users should open the anaconda prompt and run this there.
-![image info](./doc/win-anaconda-prompt2.png)
+You can install the tsdat  requirements via:
 
-## 3) OR Activate Existing Anaconda Environment
 ```bash
-conda activate tsdat_env
+pip install -r requirements.txt
 ```
+
+## Releasing to pypi
+TODO: to be replaced by CICD build instead of manual process.
+
+### Prereq: Make sure that you have twine installed
+```bash
+pip install twine
+```
+
+### 1) Update the version numbers
+1. setup.py
+2. docker/docker-compose.yml
+3. docker/build.sh
+
+Then commit tsdat with the new build numbers.
+
+### 2) Deploy the new release to pypi.
+
+```bash
+cd tsdat
+python setup.py sdist bdist_wheel
+twine upload dist/*
+```
+
+### 3) Deploy the new release to docker hub
+
+**Prereq: Log in to docker hub**
+```bash
+docker login --username=clansing
+```
+
+```bash
+cd tsdat/docker
+./build.sh
+```
+
+### 4) Create a tagged release in GitHub

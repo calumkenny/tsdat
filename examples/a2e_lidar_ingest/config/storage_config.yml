@@ -1,0 +1,16 @@
+
+storage:
+  classname:  tsdat.io.FilesystemStorage
+  parameters:
+    retain_input_files: True
+    root_dir: ${CONFIG_DIR}/../storage/root
+
+  file_handlers:
+    input:
+      sta:
+        file_pattern: '.*\.sta\.7z'
+        classname: pipeline.filehandlers.StaFileHandler
+    output:
+      netcdf:
+        file_extension: '.nc'
+        classname: tsdat.io.filehandlers.NetCdfHandler

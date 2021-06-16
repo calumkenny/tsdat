@@ -1,34 +1,48 @@
+import bisect
+import tarfile
+import zipfile
+
 import boto3
+import datetime
 import io
 import os
-import bisect
-import datetime
-import shutil
-import tarfile
-import yaml
-import zipfile
-from typing import List, Union
+import xarray as xr
+from typing import List, Union, Any
 
 from tsdat.io import DatastreamStorage, \
     TemporaryStorage, \
     DisposableLocalTempFile, \
     DisposableStorageTempFileList, \
     DisposableLocalTempFileList
-
 from tsdat.utils import DSUtil
-
 
 SEPARATOR = '$$$'
 
 
 class S3Path(str):
-    """-------------------------------------------------------------------
-    This class wraps a 'special' path string that lets us include the
+    """This class wraps a 'special' path string that lets us include the
     bucket name and region in the path, so that we can use it seamlessly
-    in boto3 APIs.
-    -------------------------------------------------------------------"""
+    in boto3 APIs.  We are creating our own string to hold the region, 
+    bucket & key (i.e., path), since boto3 needs all three in order to
+    access a file.
+
+    Example:
+    .. code-block:: python
+
+        s3_client = boto3.client('s3', region_name='eu-central-1')
+        s3_client.download_file(bucket, key, download_path)
+
+    :param bucket_name: The S3 bucket name where this file is located
+    :type bucket_name: str
+    :param bucket_path: The key to access this file in the bucket
+    :type bucket_path: str, optional
+    :param region_name: The AWS region where this file is located, defaults to None,
+        which inherits the default configured region.
+    :type region_name: str, optional
+    """
 
     def __init__(self, bucket_name: str, bucket_path: str = '', region_name: str = None):
+    
         self._bucket_name = bucket_name
         self._region_name = region_name
 
@@ -41,17 +55,10 @@ class S3Path(str):
 
         self._bucket_path = bucket_path
 
+    def __str__(self):
+        return self.bucket_path
+
     def __new__(cls, bucket_name: str, bucket_path: str, region_name: str = None):
-        """-------------------------------------------------------------------
-        We are creating our own string to hold the region, bucket & key (i.e., path),
-        since boto3 needs all three in order to access a file
-
-        Example:
-        s3_client = boto3.client('s3', region_name='eu-central-1')
-        s3_client.download_file(bucket, key, download_path)
-
-        If region_name is not specified, then the default configured region is used.
-        -------------------------------------------------------------------"""
         assert bucket_name
         assert bucket_path
 
@@ -81,6 +88,12 @@ class S3Path(str):
         return self._region_name
 
     def join(self, *args):
+        """Joins segments in an S3 path.  This method behaves
+        exactly like os.path.join.
+
+        :return: A New S3Path with the additional segments added.
+        :rtype: S3Path
+        """        
         bucket_path = self.bucket_path
 
         for segment in args:
@@ -91,6 +104,13 @@ class S3Path(str):
 
 
 class AwsTemporaryStorage(TemporaryStorage):
+    """Class used to store temporary files or perform
+    fileystem actions on files other than datastream files
+    that reside in the same AWS S3 bucket as the DatastreamStorage.
+    This is a helper class intended to be used in the internals of
+    pipeline implementations only.  It is not meant as an external API for
+    interacting with files in DatastreamStorage.
+    """    
 
     def __init__(self, *args, **kwargs):
         super(AwsTemporaryStorage, self).__init__(*args, **kwargs)
@@ -99,8 +119,17 @@ class AwsTemporaryStorage(TemporaryStorage):
         self._base_path = self.datastream_storage.temp_path.join(now.strftime("%Y-%m-%d.%H%M%S.%f"))
 
     @property
-    def base_path(self):
+    def base_path(self) -> S3Path:
         return self._base_path
+
+    def clean(self):
+        super().clean()
+
+        # Make sure all files under our temp folder are removed
+        s3 = self.datastream_storage.s3_resource
+        bucket = s3.Bucket(self.base_path.bucket_name)
+        objects = bucket.objects.filter(Prefix=self.base_path.bucket_path)
+        objects.delete()
 
     def is_tarfile(self, filepath):
         # We have to check based on filename not based upon opening the file,
@@ -141,17 +170,6 @@ class AwsTemporaryStorage(TemporaryStorage):
         return extracted_files
 
     def extract_zipfile(self, filepath) -> List[S3Path]:
-        """-------------------------------------------------------------------
-        Unzips the passed file from one S3 location into the temporary
-        folder for this invocation (i.e., base_path) in memory without
-        using local disk.
-
-        Args:
-            filepath (S3Path): The path to the zipfile in s3
-
-        Returns:
-            List[S3Path]: A list of the paths of files that were extracted
-        -------------------------------------------------------------------"""
         s3_resource = self.datastream_storage.s3_resource
         zip_obj = s3_resource.Object(bucket_name=filepath.bucket_name, key=filepath.bucket_path)
         buffer = io.BytesIO(zip_obj.get()["Body"].read())
@@ -175,24 +193,42 @@ class AwsTemporaryStorage(TemporaryStorage):
         z.close()
         return extracted_files
 
-    def extract_files(self, filepath: S3Path) -> DisposableStorageTempFileList:
+    def extract_files(self, list_or_filepath: Union[S3Path, List[S3Path]]) -> DisposableStorageTempFileList:
+
         extracted_files = []
-        delete_on_exception = True
-        is_tar = self.is_tarfile(filepath)  # .tar or .tar.gz
-        is_zip = self.is_zipfile(filepath)  # .zip
+        disposable_files = []
 
-        if is_tar or is_zip:
-            if is_tar:
-                extracted_files = self.extract_tarfile(filepath)
+        files = list_or_filepath
+        if isinstance(list_or_filepath, S3Path):
+            files = [list_or_filepath]
+
+        for filepath in files:
+            is_tar = self.is_tarfile(filepath)  # .tar or .tar.gz
+            is_zip = self.is_zipfile(filepath)  # .zip
+
+            if is_tar or is_zip:
+                # only dispose of the parent zip if set by storage policy
+                if self.datastream_storage.remove_input_files:
+                    disposable_files.append(filepath)
+
+                if is_tar:
+                    tmp_extracted_files = self.extract_tarfile(filepath)
+                else:
+                    tmp_extracted_files = self.extract_zipfile(filepath)
+
+                # Add all the files that were extracted to the zip to the
+                # list of returned files and mark them for auto-disposal
+                extracted_files.extend(tmp_extracted_files)
+                disposable_files.extend(tmp_extracted_files)
+
             else:
-                extracted_files = self.extract_zipfile(filepath)
+                # Only dispose of regular input files if set by storage policy.
+                if self.datastream_storage.remove_input_files:
+                    disposable_files.append(filepath)
 
-        else:
-            # If this is not a zip or tar file, we assume it is a regular file
-            extracted_files.append(filepath)
-            delete_on_exception = False
+                extracted_files.append(filepath)
 
-        return DisposableStorageTempFileList(extracted_files, self, delete_on_exception=delete_on_exception)
+        return DisposableStorageTempFileList(extracted_files, self, disposable_files=disposable_files)
 
     def fetch(self, file_path: S3Path, local_dir=None, disposable=True) -> DisposableLocalTempFile:
         s3_client = self.datastream_storage.s3_client
@@ -212,7 +248,7 @@ class AwsTemporaryStorage(TemporaryStorage):
         date = datetime.datetime.strptime(start_time, "%Y%m%d.%H%M%S")
         prev_date = (date - datetime.timedelta(days=1)).strftime("%Y%m%d.%H%M%S")
         next_date = (date + datetime.timedelta(days=1)).strftime("%Y%m%d.%H%M%S")
-        files = self.datastream_storage.find(datastream_name, prev_date, next_date, filetype=DatastreamStorage.FILE_TYPE.NETCDF)
+        files = self.datastream_storage.find(datastream_name, prev_date, next_date, filetype=DatastreamStorage.default_file_type)
 
         previous_filepath = None
         if files:
@@ -240,13 +276,13 @@ class AwsTemporaryStorage(TemporaryStorage):
         objects.delete()
 
     def listdir(self, filepath: S3Path) -> List[S3Path]:
-        """-----------------------------------------------------------------------
-        List the files contained under this directory's s3 key.  This
-        Will only list the files under the given directory (not subfolders).
-        TODO: At some point we might need pagination to support cases where there
-              are a huge number of files.  But this won't happen for a long time,
-              if ever.
-        -----------------------------------------------------------------------"""
+
+        # List the files contained under this directory's s3 key.  This
+        # This will only list the files under the given directory (not subfolders).
+        # TODO: At some point we might need pagination to support cases where there
+        #       are a huge number of files.  But this won't happen for a long time,
+        #       if ever.
+
         paths = []
         s3_resource = self.datastream_storage.s3_resource
         bucket = s3_resource.Bucket(filepath.bucket_name)
@@ -271,31 +307,36 @@ class AwsTemporaryStorage(TemporaryStorage):
 
 
 class AwsStorage(DatastreamStorage):
+    """DatastreamStorage subclass for an AWS S3-based filesystem.
 
-    """-----------------------------------------------------------------------
-    DatastreamStorage subclass for an AWS S3-based filesystem.  See
-    parent class for method docstrings.
-    -----------------------------------------------------------------------"""
+    :param parameters: Dictionary of parameters that should be
+        set automatically from the storage config file when this
+        class is intantiated via the DatstreamStorage.from-config()
+        method.  Defaults to {}
+        
+        Key parameters that should be set in the config file include
+        
+        :retain_input_files: Whether the input files should be cleaned
+            up after they are done processing
+        :root_dir: The bucket 'key' to use to prepend to all processed files
+            created in the persistent store.  Defaults to 'root'
+        :temp_dir: The bucket 'key' to use to prepend to all temp 
+            files created in the S3 bucket.  Defaults to 'temp'
+        :bucket_name: The name of the S3 bucket to store to
+    :type parameters: dict, optional
+    """
 
-    def __init__(self, bucket_name: str = None,
-                 storage_root_path: str = 'root',
-                 storage_temp_path: str = 'temp'):
-        """-------------------------------------------------------------------
-        Initialize the storage from the given parameters used to connect
-        to an S3 bucket.
+    def __init__(self, parameters={}):
+        super().__init__(parameters=parameters)
+        bucket_name = self.parameters.get('bucket_name')
+        storage_root_path = self.parameters.get('root_dir')
+        storage_temp_path = self.parameters.get('temp_dir')
 
-        Args:
-            bucket_name (str):  The name of the s3 bucket where the storage
-                                files will be saved.
-
-            storage_root_path (str): The path in the bucket to the root of the
-                                     storage.
-
-            storage_temp_path (str): The path in the bucket to a temporary
-                                     folder used for writing short-lived temp
-                                     files.
-        -------------------------------------------------------------------"""
         assert bucket_name
+
+        storage_root_path = 'root' if not storage_root_path else storage_root_path
+        storage_temp_path = 'temp' if not storage_temp_path else storage_temp_path
+
         self._root = S3Path(bucket_name, storage_root_path)
         self._temp_path = S3Path(bucket_name, storage_temp_path)
         self._tmp = AwsTemporaryStorage(self)
@@ -308,23 +349,6 @@ class AwsStorage(DatastreamStorage):
         session = boto3.Session()
         self._s3_client = session.client('s3')
         self._s3_resource = session.resource('s3')
-
-    @classmethod
-    def from_config(cls, config_file):
-        """-------------------------------------------------------------------
-        Load a yaml config file which provides the storage constructor
-        parameters.
-
-        Args:
-            config_file (str): The path to the config file to load
-
-        Returns:
-            AwsStorage: An AwsStorage instance created from the config file.
-        -------------------------------------------------------------------"""
-        dict = yaml.load(config_file, Loader=yaml.FullLoader)
-        return AwsStorage(bucket_name=dict['bucket_name'],
-                          storage_root_path=dict['storage_root_path'],
-                          storage_temp_path=dict['storage_temp_path'])
 
     @property
     def s3_resource(self):
@@ -347,7 +371,7 @@ class AwsStorage(DatastreamStorage):
         return self._temp_path
 
     def find(self, datastream_name: str, start_time: str, end_time: str,
-             filetype: int = None) -> List[S3Path]:
+             filetype: str = None) -> List[S3Path]:
         # TODO: think about refactoring so that you don't need both start and end time
         # TODO: if times don't include hours/min/sec, then add .000000 to the string
         subpath = DSUtil.get_datastream_directory(datastream_name=datastream_name)
@@ -358,14 +382,9 @@ class AwsStorage(DatastreamStorage):
             if start_time <= DSUtil.get_date_from_filename(file.bucket_path) < end_time:
                 storage_paths.append(file)
 
-        if filetype == DatastreamStorage.FILE_TYPE.NETCDF:
-            storage_paths = list(filter(lambda x: x.bucket_path.endswith('.nc'), storage_paths))
-
-        elif filetype == DatastreamStorage.FILE_TYPE.PLOTS:
-            storage_paths = list(filter(lambda x: DSUtil.is_image(x.bucket_path), storage_paths))
-
-        elif filetype == DatastreamStorage.FILE_TYPE.RAW:
-            storage_paths = list(filter(lambda x: '.raw.' in x.bucket_path, storage_paths))
+        if filetype is not None:
+            filter_func = DatastreamStorage.file_filters[filetype]
+            storage_paths = list(filter(filter_func, storage_paths))
 
         return sorted(storage_paths)
 
@@ -384,7 +403,7 @@ class AwsStorage(DatastreamStorage):
 
         return DisposableLocalTempFileList(fetched_files)
 
-    def save(self, local_path: str, new_filename: str = None) -> None:
+    def save_local_path(self, local_path: str, new_filename: str = None):
         # TODO: we should perform a REGEX check to make sure that the filename is valid
         filename = os.path.basename(local_path) if not new_filename else new_filename
         datastream_name = DSUtil.get_datastream_name_from_filename(filename)
@@ -393,6 +412,7 @@ class AwsStorage(DatastreamStorage):
         s3_path = self.root.join(subpath, filename)
 
         self.tmp.upload(local_path, s3_path)
+        return s3_path
 
     def exists(self, datastream_name: str, start_time: str, end_time: str, filetype: int = None) -> bool:
         datastream_store_files = self.find(datastream_name, start_time, end_time, filetype=filetype)

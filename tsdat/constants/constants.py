@@ -1,16 +1,13 @@
-import act
-import xarray as xr
-
-
-class VARS(object):
+class VARS:
+    """Class that adds keywords for referring to variables."""
     ALL = 'ALL'
+    COORDS = 'COORDS'
+    DATA_VARS = 'DATA_VARS'
 
 
-class ATTS(object):
-    """-------------------------------------------------------------------
-    Class that adds methods for interacting with tsdat data model
-    specific attributes.
-    -------------------------------------------------------------------"""
+class ATTS:
+    """Class that adds constants for interacting with tsdat data-model 
+    specific attributes."""
     # Symbolic constants for global attributes
     TITLE = 'title'
     DESCRIPTION = 'description'
@@ -22,7 +19,7 @@ class ATTS(object):
     REFERENCES = 'references'
     INPUT_FILES = 'input_files'
     LOCATION_ID = 'location_id'
-    DATASTREAM = 'datastream'
+    DATASTREAM = 'datastream_name'
     DATA_LEVEL = 'data_level'
     LOCATION_DESCRPTION = 'location_description'
     INSTRUMENT_NAME = 'instrument_name'
@@ -39,4 +36,4 @@ class ATTS(object):
     FAIL_RANGE = 'fail_range'
     WARN_RANGE = 'warn_range'
     FILL_VALUE = '_FillValue'
-
+    CORRECTIONS_APPLIED = 'corrections_applied'

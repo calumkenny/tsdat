@@ -1,87 +1,76 @@
 import yaml
-import warnings
 from yamllint import linter
 from yamllint.config import YamlLintConfig
 from typing import List, Dict
-from tsdat.config.attribute_defintion import AttributeDefinition
-from .dataset_definition import DatasetDefinition
 from .keys import Keys
-from .qctest_definition import QCTestDefinition
+from .pipeline_definition import PipelineDefinition
+from .dataset_definition import DatasetDefinition
+from .quality_manager_definition import QualityManagerDefinition
 
 
-# TODO: add api method to download yaml templates or put them all
-# in the examples folder.
-
-class Config:
+class Config:  
     """
-    Wrapper for Dictionary of config values that provides helper functions for
-    quick access.
+    Wrapper for the pipeline configuration file.
+
+    Note: in most cases, ``Config.load(filepath)`` should be used to 
+    instantiate the Config class.
+
+    :param dictionary: The pipeline configuration file as a dictionary.
+    :type dictionary: Dict
     """
 
     def __init__(self, dictionary: Dict):
-        self.dictionary = dictionary
         pipeline_dict = dictionary.get(Keys.PIPELINE)
         dataset_dict = dictionary.get(Keys.DATASET_DEFINITION)
-        qc_tests_dict = dictionary.get(Keys.QC_TESTS, None)
-        qc_tests_coord_dict = dictionary.get(Keys.QC_TESTS_COORD, None)
+        quality_managers_dict = dictionary.get(Keys.QUALITY_MANAGEMENT, {})
+        self.pipeline_definition = PipelineDefinition(pipeline_dict)
+        self.dataset_definition = DatasetDefinition(dataset_dict, self.pipeline_definition.output_datastream_name)
+        self.quality_managers = self._parse_quality_managers(quality_managers_dict)
 
-        self.pipeline = self._parse_pipeline(pipeline_dict)
-        self.dataset_definition = DatasetDefinition(dataset_dict, self.pipeline.get("type"))
+    def _parse_quality_managers(self, dictionary: Dict) -> Dict[str, QualityManagerDefinition]:        
+        """Extracts QualityManagerDefinitions from the config file.
 
-        if qc_tests_dict is not None:
-            self.qc_tests = self._parse_qc_tests(qc_tests_dict)
-
-        if qc_tests_coord_dict is not None:
-            self.qc_tests_coord = self._parse_qc_tests(qc_tests_coord_dict)
-
-
+        :param dictionary: The quality_management dictionary.
+        :type dictionary: Dict
+        :return: Mapping of quality manager name to QualityManagerDefinition
+        :rtype: Dict[str, QualityManagerDefinition]
+        """
+        quality_managers: Dict[str, QualityManagerDefinition] = {}
+        for manager_name, manager_dict in dictionary.items():
+            quality_managers[manager_name] = QualityManagerDefinition(manager_name, manager_dict)
+        return quality_managers
 
     @classmethod
     def load(self, filepaths: List[str]):
-        """-------------------------------------------------------------------
-        Load one or more yaml config files which define data following 
-        mhkit-cloud data standards.
-        
-        TODO: add a schema validation check on yaml so users can know if the 
-        file is valid
-        
-        Args:
-            filepaths (List[str]): The paths to the config files to load
+        """Load one or more yaml pipeline configuration files. Multiple files
+        should only be passed as input if the pipeline configuration file is
+        split across multiple files.
 
-        Returns:
-            Config: A Config instance created from the filepaths.
-        -------------------------------------------------------------------"""
+        :param filepaths: The path(s) to yaml configuration files to load.
+        :type filepaths: List[str]
+        :return: A Config object wrapping the yaml configuration file(s).
+        :rtype: Config
+        """
         if isinstance(filepaths, str):
             filepaths = [filepaths]
         config = dict()
         for filepath in filepaths:
             Config.lint_yaml(filepath)
             with open(filepath, 'r') as file:
-                dict_list = list(yaml.load_all(file, Loader=yaml.FullLoader))
+                dict_list = list(yaml.safe_load_all(file))
                 for dictionary in dict_list:
                     config.update(dictionary)
         return Config(config)
 
-    def get_qc_tests(self):
-        return self.qc_tests.values()
-
-    def get_qc_tests_coord(self):
-        return self.qc_tests_coord.values()
-
-    def _parse_pipeline(self, dictionary) -> Dict[str, Dict]:
-        return dictionary
-
-    def _parse_qc_tests(self, dictionary):
-        qc_tests: Dict[str, QCTestDefinition] = {}
-        for test_name, test_dict in dictionary.items():
-            qc_tests[test_name] = QCTestDefinition(test_name, test_dict)
-
-        return qc_tests
-
     @staticmethod
-    def lint_yaml(filename):
-        # new-line-at-end-of-file
-        conf = YamlLintConfig('{"extends": "relaxed", "rules": {"line-length": "disable", "trailing-spaces": "disable", "empty-lines": "disable"}}')
+    def lint_yaml(filename: str):
+        """Lints a yaml file and raises an exception if an error is found.
+
+        :param filename: The path to the file to lint.
+        :type filename: str
+        :raises Exception: Raises an exception if an error is found.
+        """
+        conf = YamlLintConfig('{"extends": "relaxed", "rules": {"line-length": "disable", "trailing-spaces": "disable", "empty-lines": "disable", "new-line-at-end-of-file": "disable"}}')
         with open(filename) as file:
             gen = linter.run(file, conf)
             errors = [error for error in gen if error.level == "error"]

@@ -1,133 +1,130 @@
-import importlib
-from typing import List, Dict
 
 import numpy as np
 import xarray as xr
 
-from tsdat.config import Config, QCTestDefinition
+from typing import List
+
+from tsdat.config import Config, QualityManagerDefinition
 from tsdat.constants import VARS
 from tsdat.utils import DSUtil
 from tsdat.config.utils import instantiate_handler
 
 
-class QC(object):
-    """-------------------------------------------------------------------
-    Class that provides static helper functions for providing quality
+class QualityManagement:
+    """Class that provides static helper functions for providing quality
     control checks on a tsdat-standardized xarray dataset.
-    -------------------------------------------------------------------"""
+    """    
 
     @staticmethod
-    def apply_tests(ds: xr.Dataset, config: Config, previous_data: xr.Dataset):
-        """-------------------------------------------------------------------
-        Applies the QC tests defined in the given Config to this dataset.
+    def run(ds: xr.Dataset, config: Config, previous_data: xr.Dataset) -> xr.Dataset:
+        """Applies the Quality Managers defined in the given Config to this dataset.
         QC results will be embedded in the dataset.  QC metadata will be
         stored as attributes, and QC flags will be stored as a bitwise integer
         in new companion qc_ variables that are added to the dataset.
         This method will create QC companion variables if they don't exist.
 
-        Args:
-            ds (xr.Dataset): The dataset to apply tests to
-            config (Config): A configuration definition (loaded from yaml)
-            previous_data(xr.Dataset): A dataset from the previous processing
-            interval (i.e., file).  This is used to check for consistency between
-            files, such as for monitonic or delta checks when we need to check
-            the previous value.
+        :param ds: The dataset to apply quality managers to
+        :type ds: xr.Dataset
+        :param config: A configuration definition (loaded from yaml)
+        :type config: Config
+        :param previous_data: A dataset from the previous processing interval 
+            (i.e., file).  This is used to check for consistency between files, 
+            such as for monitonic or delta checks when we need to check the previous value.
+        :type previous_data: xr.Dataset
+        :return: The dataset after quality checkers and handlers have been applied.
+        :rtype: xr.Dataset
+        """        
+        for definition in config.quality_managers.values():
+            quality_manager = QualityManager(ds, config, definition, previous_data)
+            ds = quality_manager.run()
 
-        Raises:
-            QCError:  A QCError indicates that a fatal error has occurred.
-
-        -------------------------------------------------------------------"""
-
-        # First run the coordinate variable tests, in order
-        qc_tests: List[QCTestDefinition] = config.get_qc_tests_coord()
-
-        for qc_test in qc_tests:
-            qc_checker = QCChecker(ds, config, qc_test, previous_data, coord=True)
-            qc_checker.run()
-
-        # Then run the other variable qc tests, in order
-        qc_tests: List[QCTestDefinition] = config.get_qc_tests()
-
-        for qc_test in qc_tests:
-            qc_checker = QCChecker(ds, config, qc_test, previous_data)
-            qc_checker.run()
+        return ds
 
 
-class QCChecker:
-    """-------------------------------------------------------------------
-    Applies a single QC test to the given Dataset, as defined by the Config
-    -------------------------------------------------------------------"""
+class QualityManager:
+    """Applies a single Quality Manager to the given Dataset, as defined by 
+    the Config
+    
+    :param ds: The dataset for which we will perform quality management.
+    :type ds: xr.Dataset
+    :param config: The Config from the pipeline definition file.
+    :type config: Config
+    :param definition: Definition of the quality test this class manages.
+    :type definition: QualityManagerDefinition
+    :param previous_data: A dataset from the previous processing interval 
+        (i.e., file).  This is used to check for consistency between files, 
+        such as for monitonic or delta checks when we need to check the previous value.
+    :type previous_data: xr.Dataset
+    """
     def __init__(self, ds: xr.Dataset,
                  config: Config,
-                 test: QCTestDefinition,
-                 previous_data: xr.Dataset,
-                 coord: bool = False):
+                 definition: QualityManagerDefinition,
+                 previous_data: xr.Dataset):
 
-        # Get the variables this test applies to
-        variable_names = test.variables
+        # Get the variables this quality manager applies to
+        variable_names = definition.variables
 
         # Convert the list to upper case in case the user made a typo in the yaml
         variable_names_upper = [x.upper() for x in variable_names]
+        
+        # Add variables where a keyword was used
+        if VARS.COORDS in variable_names_upper:
+            variable_names.remove(VARS.COORDS)
+            variable_names.extend(DSUtil.get_coordinate_variable_names(ds))
 
+        if VARS.DATA_VARS in variable_names_upper:
+            variable_names.remove(VARS.DATA_VARS)
+            variable_names.extend(DSUtil.get_non_qc_variable_names(ds))
+        
         if VARS.ALL in variable_names_upper:
-            if coord:
-                variable_names = DSUtil.get_coordinate_variable_names(ds)
-            else:
-                variable_names = DSUtil.get_non_qc_variable_names(ds)
+            variable_names.remove(VARS.ALL)
+            variable_names.extend(DSUtil.get_coordinate_variable_names(ds))
+            variable_names.extend(DSUtil.get_non_qc_variable_names(ds))
+        
+        # Remove any duplicates while preserving insertion order
+        variable_names = list(dict.fromkeys(variable_names))
 
         # Exclude any excludes
-        excludes = test.exclude
+        excludes = definition.exclude
         for exclude in excludes:
             variable_names.remove(exclude)
 
-        # Get the operator
-        operator = instantiate_handler(ds, previous_data, test, handler_desc=test.operator)
+        # Get the quality checker
+        quality_checker = instantiate_handler(ds, previous_data, definition, handler_desc=definition.checker)
 
-        # Get the error handlers (optional)
-        error_handlers = instantiate_handler(ds, previous_data, test, handler_desc=test.error_handlers)
+        # Get the quality handlers
+        handlers = definition.handlers
 
         self.ds = ds
+        self.config = config
         self.variable_names = variable_names
-        self.operator = operator
-        self.error_handlers = error_handlers
-        self.test: QCTestDefinition = test
+        self.checker = quality_checker
+        self.handlers = handlers
+        self.definition: QualityManagerDefinition = definition
         self.previous_data = previous_data
-        self.coord = coord
 
-    def run(self):
-        """-------------------------------------------------------------------
-        Runs the QC test for each specified variable
+    def run(self) -> xr.Dataset:
+        """Runs the QualityChecker and QualityHandler(s) for each specified 
+        variable as defined in the config file.
 
-        Raises:
-            QCError:  A QCError indicates that a fatal error has occurred.
-        -------------------------------------------------------------------"""
+        :return: The dataset after the quality checker and the quality handlers
+            have been run.
+        :raises QCError: A QCError indicates that a fatal error has occurred.
+        :rtype: xr.Dataset
+        """  
         for variable_name in self.variable_names:
 
-            # Apply the operator
-            results_array: np.ndarray = self.operator.run(variable_name)
+            # Apply the quality checker
+            results_array: np.ndarray = self.checker.run(variable_name)
+            if results_array is None:
+                results_array = np.zeros_like(self.ds[variable_name].data, dtype='bool')
 
-            # If results_array is None, then we just skip this test
-            if results_array is not None:
+            # Apply quality handlers
+            if self.handlers is not None:
+                for handler in self.handlers:
+                    quality_handler = instantiate_handler(self.ds, self.previous_data, self.definition, handler_desc=handler)
+                    quality_handler.run(variable_name, results_array)
+                    self.ds: xr.Dataset = quality_handler.ds
+                self.checker.ds = self.ds
 
-                # If any values fail, then call any defined error handlers
-                if np.sum(results_array) > 0 and self.error_handlers is not None:
-                    for error_handler in self.error_handlers:
-                        error_handler.run(variable_name, results_array)
-
-                # If this is not a coordinate variable, then record
-                # the test results in a qc_ companion variable
-                if not self.coord:
-                    self.ds.qcfilter.add_test(
-                        variable_name, index=results_array,
-                        test_number=self.test.qc_bit,
-                        test_meaning=self.test.meaning,
-                        test_assessment=self.test.assessment)
-            else: 
-                results_array = np.zeros_like(self.ds[variable_name].data) == 1
-
-                if not self.coord:
-                    self.ds.qcfilter.add_test(
-                        variable_name, index=results_array,
-                        test_number=self.test.qc_bit,
-                        test_meaning="N/A",
-                        test_assessment="Indeterminate")
+        return self.ds
